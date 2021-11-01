@@ -18,10 +18,11 @@ console = "0.13.0"
 clap = "2.33.2"
 ftp = "3.0.1"
 threadpool = "1.8.1"
-# failure = { version = "0.1.8", features = [] }
 url = "1.7.2"
 reqwest = {version = "0.10.8", features = ["blocking"]}
 anyhow = "1.0.43"
+log = "0.4"
+simple_logger = "1.0"
 
 [dev-dependencies]
 assert_cmd = "0.11"

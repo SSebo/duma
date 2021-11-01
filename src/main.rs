@@ -15,6 +15,9 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    let _ = simple_logger::SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init();
     let args = clap_app!(Duma =>
     (version: crate_version!())
     (author: "Matt Gathu <mattgathu@gmail.com>")

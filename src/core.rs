@@ -165,7 +165,8 @@ impl HttpDownload {
     }
 
     pub fn download(&mut self) -> Result<()> {
-        let resp = self
+        log::info!("download conf {:?}", self.conf);
+        let req = self
             .client
             .get(self.url.as_ref())
             .timeout(Duration::from_secs(self.conf.timeout))
@@ -173,9 +174,11 @@ impl HttpDownload {
             .header(
                 header::USER_AGENT,
                 HeaderValue::from_str(&self.conf.user_agent)?,
-            )
-            .send()?;
+            );
+        log::info!("req {:?}", req);
+        let resp = req.send()?;
         let headers = resp.headers();
+        log::info!("resp headers {:?}", headers);
 
         let server_supports_bytes = match headers.get(header::ACCEPT_RANGES) {
             Some(val) => val == "bytes",
@@ -250,6 +253,7 @@ impl HttpDownload {
     pub fn concurrent_download(&mut self, req: Request, ct_val: &HeaderValue) -> Result<()> {
         let (data_tx, data_rx) = mpsc::channel();
         let (errors_tx, errors_rx) = mpsc::channel();
+        log::info!("content len val {:?}", ct_val);
         let ct_len = ct_val.to_str()?.parse::<u64>()?;
         let chunk_offsets = self
             .conf
@@ -265,8 +269,15 @@ impl HttpDownload {
         }
 
         let mut count = self.conf.bytes_on_disk.unwrap_or(0);
+        let bytes_on_disk = count;
         loop {
-            if count == ct_len {
+            log::info!(
+                "count {} ct_len {} bytes_on_disk {}",
+                count,
+                ct_len,
+                bytes_on_disk
+            );
+            if count == ct_len + bytes_on_disk {
                 break;
             }
             let (byte_count, offset, buf) = data_rx.recv()?;
@@ -295,6 +306,7 @@ impl HttpDownload {
     }
 
     fn get_chunk_offsets(&self, ct_len: u64, chunk_size: u64) -> Vec<(u64, u64)> {
+        log::info!("get_chunk_offsets {} {}", ct_len, chunk_size);
         let no_of_chunks = ct_len / chunk_size;
         let mut sizes = Vec::new();
 

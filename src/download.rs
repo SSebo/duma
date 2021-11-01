@@ -179,6 +179,7 @@ pub fn http_download(url: Url, args: &ArgMatches, version: &str) -> Result<()> {
     };
     let headers = request_headers_from_server(&url, timeout, &user_agent)?;
     let fname = gen_filename(&url, args.value_of("FILE"), Some(&headers));
+    log::info!(">> headers {:?}", headers);
 
     // early exit if headers flag is present
     if args.is_present("headers") {
@@ -192,10 +193,9 @@ pub fn http_download(url: Url, args: &ArgMatches, version: &str) -> Result<()> {
     };
 
     let headers = prep_headers(&fname, resume_download, &user_agent)?;
-
     let state_file_exists = Path::new(&format!("{}.st", fname)).exists();
-    let chunk_size = 512_000u64;
-
+    // let chunk_size = 512_000u64;
+    let chunk_size = 50_64;
     let chunk_offsets =
         if state_file_exists && resume_download && concurrent_download && ct_len != 0 {
             Some(get_resume_chunk_offsets(&fname, ct_len, chunk_size)?)
@@ -203,6 +203,7 @@ pub fn http_download(url: Url, args: &ArgMatches, version: &str) -> Result<()> {
             None
         };
 
+    log::info!("chunk_offsets {:?}", chunk_offsets);
     let bytes_on_disk = if resume_download {
         calc_bytes_on_disk(&fname)?
     } else {
@@ -303,10 +304,14 @@ impl EventsHandler for DefaultEventsHandler {
             ""
         };
         println!("Type: {}", style(ct_type).green());
-
         println!("Saving to: {}", style(&self.fname).green());
         if let Some(val) = headers.get(header::CONTENT_LENGTH) {
-            self.create_prog_bar(val.to_str().unwrap_or("").parse::<u64>().ok());
+            if let Ok(val) = val.to_str().unwrap_or("").parse::<u64>() {
+                let length = val + self.bytes_on_disk.unwrap_or(0);
+                self.create_prog_bar(Some(length));
+            } else {
+                self.create_prog_bar(None);
+            }
         } else {
             println!(
                 "{}",
