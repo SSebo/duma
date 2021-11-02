@@ -79,8 +79,7 @@ async fn run() -> Result<()> {
 
     let headers = prep_headers(&fname, resume_download, &user_agent)?;
     let state_file_exists = Path::new(&format!("{}.st", fname)).exists();
-    // let chunk_size = 512_000u64;
-    let chunk_size = 50_64;
+    let chunk_size = 10240_u64;
     let chunk_offsets =
         if state_file_exists && resume_download && concurrent_download && ct_len != 0 {
             Some(get_resume_chunk_offsets(&fname, ct_len, chunk_size)?)

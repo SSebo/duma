@@ -185,16 +185,15 @@ impl HttpDownload {
             None => false,
         };
 
-        let hooks = self.hooks.clone();
-        let mut hooks_guard = hooks.lock().await;
-
         if server_supports_bytes && self.conf.headers.contains_key(header::RANGE) {
             if self.conf.concurrent {
                 self.conf.headers.remove(header::RANGE);
             }
-            (*hooks_guard)
-                .iter_mut()
-                .for_each(|hook| hook.on_server_supports_resume());
+            run_hooks(
+                self.hooks.clone(),
+                Box::new(|hook| hook.on_server_supports_resume()),
+            )
+            .await;
         }
 
         let req = self
@@ -204,9 +203,13 @@ impl HttpDownload {
             .headers(self.conf.headers.clone())
             .build()?;
 
-        (*hooks_guard)
-            .iter_mut()
-            .for_each(|hook| hook.on_headers(headers.clone()));
+        let headers_clone = headers.to_owned();
+        run_hooks(
+            self.hooks.clone(),
+            Box::new(move |hook| hook.on_headers(headers_clone.clone())),
+        )
+        .await;
+
         if server_supports_bytes
             && self.conf.concurrent
             && headers.contains_key(header::CONTENT_LENGTH)
@@ -216,7 +219,8 @@ impl HttpDownload {
         } else {
             self.singlethread_download(req).await?;
         }
-        (*hooks_guard).iter_mut().for_each(|hook| hook.on_finish());
+
+        run_hooks(self.hooks.clone(), Box::new(|hook| hook.on_finish())).await;
 
         Ok(())
     }
@@ -233,37 +237,16 @@ impl HttpDownload {
 
     async fn singlethread_download(&mut self, req: Request) -> Result<()> {
         let mut resp = self.client.execute(req).await?;
-        // let ct_len = if let Some(val) = resp.headers().get(header::CONTENT_LENGTH) {
-        //     Some(val.to_str()?.parse::<usize>()?)
-        // } else {
-        //     None
-        // };
         while let Some(bytes) = resp.chunk().await? {
             log::info!("single thread got chunk");
             self.send_content(&bytes.to_vec()).await?;
         }
-        // let mut cnt = 0;
-        // loop {
-        //     if let Some(bytes) = resp.chunk().await? {
-        //         cnt += bytes.len();
-
-        //         if bytes.len() != 0 {
-        //             self.send_content(&bytes.to_vec())?;
-        //         } else {
-        //             break;
-        //         }
-        //     }
-        //     if Some(cnt) == ct_len {
-        //         break;
-        //     }
-        // }
         Ok(())
     }
 
     pub async fn concurrent_download(&mut self, req: Request, ct_val: &HeaderValue) -> Result<()> {
         let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         let (errors_tx, mut errors_rx) = mpsc::unbounded_channel();
-        // log::info!("content len val {:?}", ct_val);
         let ct_len = ct_val.to_str()?.parse::<u64>()?;
         let chunk_offsets = self
             .conf
@@ -271,72 +254,78 @@ impl HttpDownload {
             .clone()
             .unwrap_or_else(|| self.get_chunk_offsets(ct_len, self.conf.chunk_size));
         let sem = Arc::new(Semaphore::new(self.conf.num_workers));
+        let sem_clone = sem.clone();
+        let data_tx_clone = data_tx.clone();
+        let errors_tx_clone = errors_tx.clone();
+        let req_clone = req.try_clone().unwrap();
 
-        for offsets in chunk_offsets {
-            let data_tx = data_tx.clone();
-            let errors_tx = errors_tx.clone();
-            let req = req.try_clone().unwrap();
-            let permit = sem.clone().acquire_owned().await;
-            tokio::spawn(async move {
-                let _permit = permit;
-                download_chunk(req, offsets, data_tx.clone(), errors_tx).await
-            });
-        }
+        tokio::spawn(async move {
+            for offsets in chunk_offsets {
+                let data_tx = data_tx_clone.clone();
+                let errors_tx = errors_tx_clone.clone();
+                let req = req_clone.try_clone().unwrap();
+                let permit = sem_clone.clone().acquire_owned().await;
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    download_chunk(req, offsets, data_tx.clone(), errors_tx).await
+                });
+            }
+        });
 
         let mut count = self.conf.bytes_on_disk.unwrap_or(0);
         let hooks = self.hooks.clone();
+        let hooks_clone = self.hooks.clone();
         let retries = self.retries.clone();
         let max_retries = self.conf.max_retries;
-        tokio::spawn(async move {
-            let bytes_on_disk = count;
-            loop {
-                // log::info!(
-                //     "count {} ct_len {} bytes_on_disk {}",
-                //     count,
-                //     ct_len,
-                //     bytes_on_disk
-                // );
-                if count == ct_len + bytes_on_disk {
-                    break;
-                }
-                if let Some((byte_count, offset, buf)) = data_rx.recv().await {
-                    log::info!("got chunk {}", byte_count);
-                    count += byte_count;
-                    let mut hooks_guard = hooks.lock().await;
-                    if let Err(e) = (*hooks_guard)
-                        .iter_mut()
-                        .try_for_each(|hk| hk.on_concurrent_content((byte_count, offset, &buf)))
-                    {
-                        log::error!("concurrent_content error {:?}", e);
-                        return;
-                    }
-                }
+        let bytes_on_disk = count;
 
-                match tokio::time::timeout(tokio::time::Duration::from_micros(1), errors_rx.recv())
-                    .await
-                {
-                    Err(_) => {}
-                    Ok(None) => {}
-                    Ok(Some(offsets)) => {
-                        let mut retry_guard = retries.lock().await;
-                        let mut hooks_guard = hooks.lock().await;
-                        log::error!("timeout retry {}", *retry_guard);
-                        if *retry_guard > max_retries {
-                            (*hooks_guard).iter_mut().for_each(|hk| hk.on_max_retries());
-                        }
-                        *retry_guard += 1;
-                        let data_tx = data_tx.clone();
-                        let errors_tx = errors_tx.clone();
-                        let req = req.try_clone().unwrap();
-                        let permit = sem.clone().acquire_owned().await;
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            download_chunk(req, offsets, data_tx, errors_tx).await
-                        });
+        tokio::spawn(async move {
+            match tokio::time::timeout(tokio::time::Duration::from_micros(1), errors_rx.recv())
+                .await
+            {
+                Err(_) => {}
+                Ok(None) => {}
+                Ok(Some(offsets)) => {
+                    let mut retry_guard = retries.lock().await;
+                    log::error!("timeout retry {}", *retry_guard);
+                    if *retry_guard > max_retries {
+                        run_hooks(hooks, Box::new(|hk| hk.on_max_retries())).await;
                     }
+
+                    *retry_guard += 1;
+                    let data_tx = data_tx.clone();
+                    let errors_tx = errors_tx.clone();
+                    let req = req.try_clone().unwrap();
+                    let permit = sem.clone().acquire_owned().await;
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        download_chunk(req, offsets, data_tx, errors_tx).await
+                    });
                 }
             }
         });
+
+        loop {
+            if count == ct_len + bytes_on_disk {
+                break;
+            }
+            if let Some((byte_count, offset, buf)) = data_rx.recv().await {
+                log::info!("got chunk {}", byte_count);
+                count += byte_count;
+                log::info!("try get lock");
+                // let mut hooks_guard = hooks_clone.lock().await;
+                log::info!("got lock");
+                if let Err(e) = try_run_hooks(
+                    hooks_clone.clone(),
+                    Box::new(move |hk| hk.on_concurrent_content((byte_count, offset, &buf))),
+                )
+                .await
+                {
+                    log::error!("concurrent_content error {:?}", e);
+                    return Err(e);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -416,4 +405,21 @@ async fn download_chunk(
             {}
         }
     }
+}
+
+pub async fn run_hooks(
+    hooks: Arc<Mutex<Vec<Box<dyn EventsHandler + Send>>>>,
+    f: Box<dyn FnMut(&mut Box<(dyn EventsHandler + Send + 'static)>) + Send>,
+) {
+    let mut hooks_guard = hooks.lock().await;
+    (*hooks_guard).iter_mut().for_each(f);
+    drop(hooks_guard);
+}
+
+pub async fn try_run_hooks(
+    hooks: Arc<Mutex<Vec<Box<dyn EventsHandler + Send>>>>,
+    f: Box<dyn FnMut(&mut Box<(dyn EventsHandler + Send + 'static)>) -> Result<()> + Send>,
+) -> Result<()> {
+    let mut hooks_guard = hooks.lock().await;
+    (*hooks_guard).iter_mut().try_for_each(f)
 }
