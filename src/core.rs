@@ -1,17 +1,16 @@
+use anyhow::{format_err, Result};
+use ftp::FtpStream;
+use reqwest::header::{self, HeaderMap, HeaderValue};
+use reqwest::{Client, Request};
 use std::cell::RefCell;
 use std::fmt;
 use std::io::Read;
-use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
-
-use anyhow::{format_err, Result};
-use reqwest::blocking::{Client, Request};
-use reqwest::header::{self, HeaderMap, HeaderValue};
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use url::Url;
-
-use threadpool::ThreadPool;
-
-use ftp::FtpStream;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -26,6 +25,7 @@ pub struct Config {
     pub bytes_on_disk: Option<u64>,
     pub chunk_offsets: Option<Vec<(u64, u64)>>,
     pub chunk_size: u64,
+    pub quiet_mode: bool,
 }
 
 #[allow(unused_variables)]
@@ -141,9 +141,9 @@ impl FtpDownload {
 
 pub struct HttpDownload {
     url: Url,
-    hooks: Vec<RefCell<Box<dyn EventsHandler>>>,
+    hooks: Arc<Mutex<Vec<Box<dyn EventsHandler + Send>>>>,
     conf: Config,
-    retries: i32,
+    retries: Arc<Mutex<i32>>,
     client: Client,
 }
 
@@ -157,14 +157,14 @@ impl HttpDownload {
     pub fn new(url: Url, conf: Config) -> HttpDownload {
         HttpDownload {
             url,
-            hooks: Vec::new(),
+            hooks: Arc::new(Mutex::new(Vec::new())),
             conf,
-            retries: 0,
+            retries: Arc::new(Mutex::new(0)),
             client: Client::new(),
         }
     }
 
-    pub fn download(&mut self) -> Result<()> {
+    pub async fn download(&mut self) -> Result<()> {
         log::info!("download conf {:?}", self.conf);
         let req = self
             .client
@@ -176,7 +176,7 @@ impl HttpDownload {
                 HeaderValue::from_str(&self.conf.user_agent)?,
             );
         log::info!("req {:?}", req);
-        let resp = req.send()?;
+        let resp = req.send().await?;
         let headers = resp.headers();
         log::info!("resp headers {:?}", headers);
 
@@ -185,13 +185,16 @@ impl HttpDownload {
             None => false,
         };
 
+        let hooks = self.hooks.clone();
+        let mut hooks_guard = hooks.lock().await;
+
         if server_supports_bytes && self.conf.headers.contains_key(header::RANGE) {
             if self.conf.concurrent {
                 self.conf.headers.remove(header::RANGE);
             }
-            for hook in &self.hooks {
-                hook.borrow_mut().on_server_supports_resume();
-            }
+            (*hooks_guard)
+                .iter_mut()
+                .for_each(|hook| hook.on_server_supports_resume());
         }
 
         let req = self
@@ -201,107 +204,139 @@ impl HttpDownload {
             .headers(self.conf.headers.clone())
             .build()?;
 
-        for hk in &self.hooks {
-            hk.borrow_mut().on_headers(headers.clone());
-        }
+        (*hooks_guard)
+            .iter_mut()
+            .for_each(|hook| hook.on_headers(headers.clone()));
         if server_supports_bytes
             && self.conf.concurrent
             && headers.contains_key(header::CONTENT_LENGTH)
         {
-            self.concurrent_download(req, headers.get(header::CONTENT_LENGTH).unwrap())?;
+            self.concurrent_download(req, headers.get(header::CONTENT_LENGTH).unwrap())
+                .await?;
         } else {
-            self.singlethread_download(req)?;
+            self.singlethread_download(req).await?;
         }
-
-        for hook in &self.hooks {
-            hook.borrow_mut().on_finish();
-        }
+        (*hooks_guard).iter_mut().for_each(|hook| hook.on_finish());
 
         Ok(())
     }
 
-    pub fn events_hook<E: EventsHandler + 'static>(&mut self, hk: E) -> &mut HttpDownload {
-        self.hooks.push(RefCell::new(Box::new(hk)));
+    pub async fn events_hook<E: EventsHandler + 'static + Send>(
+        &mut self,
+        hk: E,
+    ) -> &mut HttpDownload {
+        let hooks = self.hooks.clone();
+        let mut guard = hooks.lock().await;
+        (*guard).push(Box::new(hk));
         self
     }
 
-    fn singlethread_download(&mut self, req: Request) -> Result<()> {
-        let mut resp = self.client.execute(req)?;
-        let ct_len = if let Some(val) = resp.headers().get(header::CONTENT_LENGTH) {
-            Some(val.to_str()?.parse::<usize>()?)
-        } else {
-            None
-        };
-        let mut cnt = 0;
-        loop {
-            let mut buffer = vec![0; self.conf.chunk_size as usize];
-            let bcount = resp.read(&mut buffer[..])?;
-            cnt += bcount;
-            buffer.truncate(bcount);
-            if !buffer.is_empty() {
-                self.send_content(buffer.as_slice())?;
-            } else {
-                break;
-            }
-            if Some(cnt) == ct_len {
-                break;
-            }
+    async fn singlethread_download(&mut self, req: Request) -> Result<()> {
+        let mut resp = self.client.execute(req).await?;
+        // let ct_len = if let Some(val) = resp.headers().get(header::CONTENT_LENGTH) {
+        //     Some(val.to_str()?.parse::<usize>()?)
+        // } else {
+        //     None
+        // };
+        while let Some(bytes) = resp.chunk().await? {
+            log::info!("single thread got chunk");
+            self.send_content(&bytes.to_vec()).await?;
         }
+        // let mut cnt = 0;
+        // loop {
+        //     if let Some(bytes) = resp.chunk().await? {
+        //         cnt += bytes.len();
+
+        //         if bytes.len() != 0 {
+        //             self.send_content(&bytes.to_vec())?;
+        //         } else {
+        //             break;
+        //         }
+        //     }
+        //     if Some(cnt) == ct_len {
+        //         break;
+        //     }
+        // }
         Ok(())
     }
 
-    pub fn concurrent_download(&mut self, req: Request, ct_val: &HeaderValue) -> Result<()> {
-        let (data_tx, data_rx) = mpsc::channel();
-        let (errors_tx, errors_rx) = mpsc::channel();
-        log::info!("content len val {:?}", ct_val);
+    pub async fn concurrent_download(&mut self, req: Request, ct_val: &HeaderValue) -> Result<()> {
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+        let (errors_tx, mut errors_rx) = mpsc::unbounded_channel();
+        // log::info!("content len val {:?}", ct_val);
         let ct_len = ct_val.to_str()?.parse::<u64>()?;
         let chunk_offsets = self
             .conf
             .chunk_offsets
             .clone()
             .unwrap_or_else(|| self.get_chunk_offsets(ct_len, self.conf.chunk_size));
-        let worker_pool = ThreadPool::new(self.conf.num_workers);
+        let sem = Arc::new(Semaphore::new(self.conf.num_workers));
+
         for offsets in chunk_offsets {
             let data_tx = data_tx.clone();
             let errors_tx = errors_tx.clone();
             let req = req.try_clone().unwrap();
-            worker_pool.execute(move || download_chunk(req, offsets, data_tx.clone(), errors_tx))
+            let permit = sem.clone().acquire_owned().await;
+            tokio::spawn(async move {
+                let _permit = permit;
+                download_chunk(req, offsets, data_tx.clone(), errors_tx).await
+            });
         }
 
         let mut count = self.conf.bytes_on_disk.unwrap_or(0);
-        let bytes_on_disk = count;
-        loop {
-            log::info!(
-                "count {} ct_len {} bytes_on_disk {}",
-                count,
-                ct_len,
-                bytes_on_disk
-            );
-            if count == ct_len + bytes_on_disk {
-                break;
-            }
-            let (byte_count, offset, buf) = data_rx.recv()?;
-            count += byte_count;
-            for hk in &self.hooks {
-                hk.borrow_mut()
-                    .on_concurrent_content((byte_count, offset, &buf))?;
-            }
-            match errors_rx.recv_timeout(Duration::from_micros(1)) {
-                Err(_) => {}
-                Ok(offsets) => {
-                    if self.retries > self.conf.max_retries {
-                        for hk in &self.hooks {
-                            hk.borrow_mut().on_max_retries();
-                        }
+        let hooks = self.hooks.clone();
+        let retries = self.retries.clone();
+        let max_retries = self.conf.max_retries;
+        tokio::spawn(async move {
+            let bytes_on_disk = count;
+            loop {
+                // log::info!(
+                //     "count {} ct_len {} bytes_on_disk {}",
+                //     count,
+                //     ct_len,
+                //     bytes_on_disk
+                // );
+                if count == ct_len + bytes_on_disk {
+                    break;
+                }
+                if let Some((byte_count, offset, buf)) = data_rx.recv().await {
+                    log::info!("got chunk {}", byte_count);
+                    count += byte_count;
+                    let mut hooks_guard = hooks.lock().await;
+                    if let Err(e) = (*hooks_guard)
+                        .iter_mut()
+                        .try_for_each(|hk| hk.on_concurrent_content((byte_count, offset, &buf)))
+                    {
+                        log::error!("concurrent_content error {:?}", e);
+                        return;
                     }
-                    self.retries += 1;
-                    let data_tx = data_tx.clone();
-                    let errors_tx = errors_tx.clone();
-                    let req = req.try_clone().unwrap();
-                    worker_pool.execute(move || download_chunk(req, offsets, data_tx, errors_tx))
+                }
+
+                match tokio::time::timeout(tokio::time::Duration::from_micros(1), errors_rx.recv())
+                    .await
+                {
+                    Err(_) => {}
+                    Ok(None) => {}
+                    Ok(Some(offsets)) => {
+                        let mut retry_guard = retries.lock().await;
+                        let mut hooks_guard = hooks.lock().await;
+                        log::error!("timeout retry {}", *retry_guard);
+                        if *retry_guard > max_retries {
+                            (*hooks_guard).iter_mut().for_each(|hk| hk.on_max_retries());
+                        }
+                        *retry_guard += 1;
+                        let data_tx = data_tx.clone();
+                        let errors_tx = errors_tx.clone();
+                        let req = req.try_clone().unwrap();
+                        let permit = sem.clone().acquire_owned().await;
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            download_chunk(req, offsets, data_tx, errors_tx).await
+                        });
+                    }
                 }
             }
-        }
+        });
         Ok(())
     }
 
@@ -325,25 +360,24 @@ impl HttpDownload {
         sizes
     }
 
-    fn send_content(&mut self, contents: &[u8]) -> Result<()> {
-        for hk in &self.hooks {
-            hk.borrow_mut().on_content(contents)?;
-        }
-
-        Ok(())
+    async fn send_content(&mut self, contents: &[u8]) -> Result<()> {
+        let mut hooks = self.hooks.lock().await;
+        (*hooks)
+            .iter_mut()
+            .try_for_each(|hk| hk.on_content(contents))
     }
 }
 
-fn download_chunk(
+async fn download_chunk(
     req: Request,
     offsets: (u64, u64),
-    sender: mpsc::Sender<(u64, u64, Vec<u8>)>,
-    errors: mpsc::Sender<(u64, u64)>,
+    sender: mpsc::UnboundedSender<(u64, u64, Vec<u8>)>,
+    errors: mpsc::UnboundedSender<(u64, u64)>,
 ) {
-    fn inner(
+    async fn inner(
         mut req: Request,
         offsets: (u64, u64),
-        sender: mpsc::Sender<(u64, u64, Vec<u8>)>,
+        sender: mpsc::UnboundedSender<(u64, u64, Vec<u8>)>,
         start_offset: &mut u64,
     ) -> Result<()> {
         let byte_range = format!("bytes={}-{}", offsets.0, offsets.1);
@@ -351,17 +385,18 @@ fn download_chunk(
         headers.insert(header::RANGE, HeaderValue::from_str(&byte_range)?);
         headers.insert(header::ACCEPT, HeaderValue::from_str("*/*")?);
         headers.insert(header::CONNECTION, HeaderValue::from_str("keep-alive")?);
-        let mut resp = Client::new().execute(req)?;
+        log::info!("chunk header {:?}", headers);
+        let mut res = Client::new().execute(req).await?;
         let chunk_sz = offsets.1 - offsets.0;
         let mut cnt = 0u64;
-        loop {
-            let mut buf = vec![0; chunk_sz as usize];
-            let byte_count = resp.read(&mut buf[..])?;
+
+        while let Some(bytes) = res.chunk().await? {
+            let byte_count = bytes.len();
             cnt += byte_count as u64;
-            buf.truncate(byte_count);
-            if !buf.is_empty() {
-                sender.send((byte_count as u64, *start_offset, buf.clone()))?;
+            if byte_count != 0 {
+                sender.send((byte_count as u64, *start_offset, bytes.to_vec()))?;
                 *start_offset += byte_count as u64;
+                log::info!("chunk stream {}", byte_count);
             } else {
                 break;
             }
@@ -374,7 +409,7 @@ fn download_chunk(
     }
     let mut start_offset = offsets.0;
     let end_offset = offsets.1;
-    match inner(req, offsets, sender, &mut start_offset) {
+    match inner(req, offsets, sender, &mut start_offset).await {
         Ok(_) => {}
         Err(_) => {
             if errors.send((start_offset, end_offset)).is_ok() {};

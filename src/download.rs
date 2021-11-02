@@ -4,11 +4,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{format_err, Result};
-use clap::ArgMatches;
 use console::style;
 use indicatif::{HumanBytes, ProgressBar};
-use reqwest::blocking::Client;
 use reqwest::header::{self, HeaderMap, HeaderValue};
+use reqwest::Client;
 
 use url::Url;
 
@@ -16,17 +15,18 @@ use crate::bar::create_progress_bar;
 use crate::core::{Config, EventsHandler, FtpDownload, HttpDownload};
 use crate::utils::{decode_percent_encoded_data, get_file_handle};
 
-fn request_headers_from_server(url: &Url, timeout: u64, ua: &str) -> Result<HeaderMap> {
+pub async fn request_headers_from_server(url: &Url, timeout: u64, ua: &str) -> Result<HeaderMap> {
     let resp = Client::new()
         .get(url.as_ref())
         .timeout(Duration::from_secs(timeout))
         .header(header::USER_AGENT, HeaderValue::from_str(ua)?)
         .header(header::ACCEPT, HeaderValue::from_str("*/*")?)
-        .send()?;
+        .send()
+        .await?;
     Ok(resp.headers().clone())
 }
 
-fn print_headers(headers: HeaderMap) {
+pub fn print_headers(headers: HeaderMap) {
     for (hdr, val) in headers.iter() {
         println!(
             "{}: {}",
@@ -36,7 +36,11 @@ fn print_headers(headers: HeaderMap) {
     }
 }
 
-fn get_resume_chunk_offsets(fname: &str, ct_len: u64, chunk_size: u64) -> Result<Vec<(u64, u64)>> {
+pub fn get_resume_chunk_offsets(
+    fname: &str,
+    ct_len: u64,
+    chunk_size: u64,
+) -> Result<Vec<(u64, u64)>> {
     let st_fname = format!("{}.st", fname);
     let input = fs::File::open(st_fname)?;
     let buf = BufReader::new(input);
@@ -67,7 +71,7 @@ fn get_resume_chunk_offsets(fname: &str, ct_len: u64, chunk_size: u64) -> Result
     Ok(chunks)
 }
 
-fn gen_filename(url: &Url, fname: Option<&str>, headers: Option<&HeaderMap>) -> String {
+pub fn gen_filename(url: &Url, fname: Option<&str>, headers: Option<&HeaderMap>) -> String {
     let content_disposition = headers
         .and_then(|hdrs| hdrs.get(header::CONTENT_DISPOSITION))
         .and_then(|val| {
@@ -113,7 +117,7 @@ fn gen_filename(url: &Url, fname: Option<&str>, headers: Option<&HeaderMap>) -> 
     }
 }
 
-fn calc_bytes_on_disk(fname: &str) -> Result<Option<u64>> {
+pub fn calc_bytes_on_disk(fname: &str) -> Result<Option<u64>> {
     // use state file if present
     let st_fname = format!("{}.st", fname);
     if Path::new(&st_fname).exists() {
@@ -136,7 +140,7 @@ fn calc_bytes_on_disk(fname: &str) -> Result<Option<u64>> {
     }
 }
 
-fn prep_headers(fname: &str, resume: bool, user_agent: &str) -> Result<HeaderMap> {
+pub fn prep_headers(fname: &str, resume: bool, user_agent: &str) -> Result<HeaderMap> {
     let bytes_on_disk = calc_bytes_on_disk(fname)?;
     let mut headers = HeaderMap::new();
     if let Some(bcount) = bytes_on_disk {
@@ -160,75 +164,11 @@ pub fn ftp_download(url: Url, quiet_mode: bool, filename: Option<&str>) -> Resul
     Ok(())
 }
 
-pub fn http_download(url: Url, args: &ArgMatches, version: &str) -> Result<()> {
-    let resume_download = args.is_present("continue");
-    let concurrent_download = !args.is_present("singlethread");
-    let user_agent = args
-        .value_of("AGENT")
-        .unwrap_or(&format!("Duma/{}", version))
-        .to_owned();
-    let timeout = if let Some(secs) = args.value_of("SECONDS") {
-        secs.parse::<u64>()?
-    } else {
-        30u64
-    };
-    let num_workers = if let Some(num) = args.value_of("NUM_CONNECTIONS") {
-        num.parse::<usize>()?
-    } else {
-        8usize
-    };
-    let headers = request_headers_from_server(&url, timeout, &user_agent)?;
-    let fname = gen_filename(&url, args.value_of("FILE"), Some(&headers));
-    log::info!(">> headers {:?}", headers);
-
-    // early exit if headers flag is present
-    if args.is_present("headers") {
-        print_headers(headers);
-        return Ok(());
-    }
-    let ct_len = if let Some(val) = headers.get("Content-Length") {
-        val.to_str()?.parse::<u64>().unwrap_or(0)
-    } else {
-        0u64
-    };
-
-    let headers = prep_headers(&fname, resume_download, &user_agent)?;
-    let state_file_exists = Path::new(&format!("{}.st", fname)).exists();
-    // let chunk_size = 512_000u64;
-    let chunk_size = 50_64;
-    let chunk_offsets =
-        if state_file_exists && resume_download && concurrent_download && ct_len != 0 {
-            Some(get_resume_chunk_offsets(&fname, ct_len, chunk_size)?)
-        } else {
-            None
-        };
-
-    log::info!("chunk_offsets {:?}", chunk_offsets);
-    let bytes_on_disk = if resume_download {
-        calc_bytes_on_disk(&fname)?
-    } else {
-        None
-    };
-
-    let conf = Config {
-        user_agent,
-        resume: resume_download,
-        headers,
-        file: fname.clone(),
-        timeout,
-        concurrent: concurrent_download,
-        max_retries: 100,
-        num_workers,
-        bytes_on_disk,
-        chunk_offsets,
-        chunk_size,
-    };
-
-    let mut client = HttpDownload::new(url, conf);
-    let quiet_mode = args.is_present("quiet");
+pub async fn http_download(url: Url, conf: Config) -> Result<()> {
+    let mut client = HttpDownload::new(url, conf.clone());
     let events_handler =
-        DefaultEventsHandler::new(&fname, resume_download, concurrent_download, quiet_mode)?;
-    client.events_hook(events_handler).download()?;
+        DefaultEventsHandler::new(&conf.file, conf.resume, conf.concurrent, conf.quiet_mode)?;
+    client.events_hook(events_handler).await.download().await?;
     Ok(())
 }
 
@@ -342,6 +282,11 @@ impl EventsHandler for DefaultEventsHandler {
 
     fn on_concurrent_content(&mut self, content: (u64, u64, &[u8])) -> Result<()> {
         let (byte_count, offset, buf) = content;
+        log::info!(
+            "on_concurrent_content count {} offset {}",
+            byte_count,
+            offset
+        );
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(buf)?;
         self.file.flush()?;
@@ -360,6 +305,7 @@ impl EventsHandler for DefaultEventsHandler {
     }
 
     fn on_finish(&mut self) {
+        log::info!("on_finish");
         if let Some(ref mut b) = self.prog_bar {
             b.finish();
         }

@@ -1,8 +1,13 @@
+use std::path::Path;
 use std::process;
 
 use anyhow::{format_err, Result};
 use clap::{clap_app, crate_version};
-use duma::download::{ftp_download, http_download};
+use duma::core::Config;
+use duma::download::{
+    calc_bytes_on_disk, ftp_download, gen_filename, get_resume_chunk_offsets, http_download,
+    prep_headers, print_headers, request_headers_from_server,
+};
 use duma::utils;
 fn main() {
     match run() {
@@ -14,7 +19,8 @@ fn main() {
     }
 }
 
-fn run() -> Result<()> {
+#[tokio::main]
+async fn run() -> Result<()> {
     let _ = simple_logger::SimpleLogger::new()
         .with_level(log::LevelFilter::Info)
         .init();
@@ -40,10 +46,73 @@ fn run() -> Result<()> {
     )?;
     let quiet_mode = args.is_present("quiet");
     let file_name = args.value_of("FILE");
+    let version = crate_version!();
+    let resume_download = args.is_present("continue");
+    let concurrent_download = !args.is_present("singlethread");
+    let user_agent = args
+        .value_of("AGENT")
+        .unwrap_or(&format!("Duma/{}", version))
+        .to_owned();
+    let timeout = if let Some(secs) = args.value_of("SECONDS") {
+        secs.parse::<u64>()?
+    } else {
+        30u64
+    };
+    let num_workers = if let Some(num) = args.value_of("NUM_CONNECTIONS") {
+        num.parse::<usize>()?
+    } else {
+        2usize
+    };
+    let headers = request_headers_from_server(&url, timeout, &user_agent).await?;
+    let fname = gen_filename(&url, args.value_of("FILE"), Some(&headers));
+
+    // early exit if headers flag is present
+    if args.is_present("headers") {
+        print_headers(headers);
+        return Ok(());
+    }
+    let ct_len = if let Some(val) = headers.get("Content-Length") {
+        val.to_str()?.parse::<u64>().unwrap_or(0)
+    } else {
+        0u64
+    };
+
+    let headers = prep_headers(&fname, resume_download, &user_agent)?;
+    let state_file_exists = Path::new(&format!("{}.st", fname)).exists();
+    // let chunk_size = 512_000u64;
+    let chunk_size = 50_64;
+    let chunk_offsets =
+        if state_file_exists && resume_download && concurrent_download && ct_len != 0 {
+            Some(get_resume_chunk_offsets(&fname, ct_len, chunk_size)?)
+        } else {
+            None
+        };
+
+    log::info!("chunk_offsets {:?}", chunk_offsets);
+    let bytes_on_disk = if resume_download {
+        calc_bytes_on_disk(&fname)?
+    } else {
+        None
+    };
+
+    let conf = Config {
+        user_agent,
+        resume: resume_download,
+        headers,
+        file: fname.clone(),
+        timeout,
+        concurrent: concurrent_download,
+        max_retries: 100,
+        num_workers,
+        bytes_on_disk,
+        chunk_offsets,
+        chunk_size,
+        quiet_mode: args.is_present("quiet"),
+    };
 
     match url.scheme() {
         "ftp" => ftp_download(url, quiet_mode, file_name),
-        "http" | "https" => http_download(url, &args, crate_version!()),
+        "http" | "https" => http_download(url, conf).await,
         _ => utils::gen_error(format!("unsupported url scheme '{}'", url.scheme())),
     }
 }

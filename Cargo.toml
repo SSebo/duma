@@ -8,7 +8,11 @@ homepage = "https://github.com/mattgathu/duma"
 repository = "https://github.com/mattgathu/duma"
 readme = "README.md"
 keywords = ["http", "client", "cli", "file", "download"]
-categories = ["web-programming::http-client", "command-line-utilities", "network-programming"]
+categories = [
+	"web-programming::http-client",
+	"command-line-utilities",
+	"network-programming",
+]
 license = "MIT"
 edition = "2018"
 
@@ -19,10 +23,13 @@ clap = "2.33.2"
 ftp = "3.0.1"
 threadpool = "1.8.1"
 url = "1.7.2"
-reqwest = {version = "0.10.8", features = ["blocking"]}
+reqwest = { version = "0.11.0", features = ["json", "rustls-tls", "gzip"] }
 anyhow = "1.0.43"
 log = "0.4"
 simple_logger = "1.0"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+bytes = "1.0"
 
 [dev-dependencies]
 assert_cmd = "0.11"
