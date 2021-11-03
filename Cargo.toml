@@ -2,26 +2,41 @@
 name = "duma"
 version = "0.2.0"
 authors = ["Matt Gathu <mattgathu@gmail.com>"]
+edition = "2018"
 description = "A minimal file downloader"
 documentation = "https://github.com/mattgathu/duma"
 homepage = "https://github.com/mattgathu/duma"
 repository = "https://github.com/mattgathu/duma"
 readme = "README.md"
 keywords = ["http", "client", "cli", "file", "download"]
+resolver = "2"
 categories = [
 	"web-programming::http-client",
 	"command-line-utilities",
 	"network-programming",
 ]
+
+[lib]
+name = "duma"
+path = "src/lib.rs"
+
+[[bin]]
+name = "duma"
+path = "src/main.rs"
+
 license = "MIT"
 edition = "2018"
 
+[features]
+default = ["indicatif", "console", "clap", "enable-ftp"]
+enable-ftp = ["ftp"]
+
+
 [dependencies]
-indicatif = "0.15.0"
-console = "0.13.0"
-clap = "2.33.2"
-ftp = "3.0.1"
-threadpool = "1.8.1"
+indicatif = { version = "0.15.0", optional = true }
+console = { version = "0.13.0", optional = true }
+clap = { version = "2.33.2", optional = true }
+ftp = { version = "3.0.1", optional = true }
 url = "1.7.2"
 reqwest = { version = "0.11.0", features = ["json", "rustls-tls", "gzip"] }
 anyhow = "1.0.43"

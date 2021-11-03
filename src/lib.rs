@@ -1,4 +1,9 @@
+#[cfg(feature = "default")]
 pub mod bar;
+#[cfg(feature = "default")]
+pub mod cmd;
 pub mod core;
 pub mod download;
+#[cfg(feature = "ftp")]
+pub mod ftp;
 pub mod utils;

@@ -3,16 +3,22 @@ use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(feature = "ftp")]
+use crate::ftp::FtpDownload;
 use anyhow::{format_err, Result};
+#[cfg(feature = "default")]
 use console::style;
+#[cfg(feature = "default")]
 use indicatif::{HumanBytes, ProgressBar};
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::Client;
 
 use url::Url;
 
+#[cfg(feature = "default")]
 use crate::bar::create_progress_bar;
-use crate::core::{Config, EventsHandler, FtpDownload, HttpDownload};
+
+use crate::core::{Config, EventsHandler, HttpDownload};
 use crate::utils::{decode_percent_encoded_data, get_file_handle};
 
 pub async fn request_headers_from_server(url: &Url, timeout: u64, ua: &str) -> Result<HeaderMap> {
@@ -26,6 +32,7 @@ pub async fn request_headers_from_server(url: &Url, timeout: u64, ua: &str) -> R
     Ok(resp.headers().clone())
 }
 
+#[cfg(feature = "default")]
 pub fn print_headers(headers: HeaderMap) {
     for (hdr, val) in headers.iter() {
         println!(
@@ -155,6 +162,7 @@ pub fn prep_headers(fname: &str, resume: bool, user_agent: &str) -> Result<Heade
     Ok(headers)
 }
 
+#[cfg(feature = "enable-ftp")]
 pub fn ftp_download(url: Url, quiet_mode: bool, filename: Option<&str>) -> Result<()> {
     let fname = gen_filename(&url, filename, None);
 
@@ -173,6 +181,7 @@ pub async fn http_download(url: Url, conf: Config) -> Result<()> {
 }
 
 pub struct DefaultEventsHandler {
+    #[cfg(feature = "default")]
     prog_bar: Option<ProgressBar>,
     bytes_on_disk: Option<u64>,
     fname: String,
@@ -200,6 +209,7 @@ impl DefaultEventsHandler {
             None
         };
         Ok(DefaultEventsHandler {
+            #[cfg(feature = "default")]
             prog_bar: None,
             bytes_on_disk: calc_bytes_on_disk(fname)?,
             fname: fname.to_owned(),
@@ -210,6 +220,7 @@ impl DefaultEventsHandler {
         })
     }
 
+    #[cfg(feature = "default")]
     fn create_prog_bar(&mut self, length: Option<u64>) {
         let byte_count = if self.server_supports_resume {
             self.bytes_on_disk
@@ -229,37 +240,44 @@ impl DefaultEventsHandler {
         if let Some(count) = byte_count {
             prog_bar.inc(count);
         }
+
         self.prog_bar = Some(prog_bar);
     }
 }
 
 impl EventsHandler for DefaultEventsHandler {
+    #[allow(unused_variables)]
     fn on_headers(&mut self, headers: HeaderMap) {
         if self.quiet_mode {
             return;
         }
-        let ct_type = if let Some(val) = headers.get(header::CONTENT_TYPE) {
-            val.to_str().unwrap_or("")
-        } else {
-            ""
-        };
-        println!("Type: {}", style(ct_type).green());
-        println!("Saving to: {}", style(&self.fname).green());
-        if let Some(val) = headers.get(header::CONTENT_LENGTH) {
-            if let Ok(val) = val.to_str().unwrap_or("").parse::<u64>() {
-                let length = val + self.bytes_on_disk.unwrap_or(0);
-                self.create_prog_bar(Some(length));
+        #[cfg(feature = "default")]
+        {
+            let ct_type = if let Some(val) = headers.get(header::CONTENT_TYPE) {
+                val.to_str().unwrap_or("")
             } else {
-                self.create_prog_bar(None);
+                ""
+            };
+
+            println!("Type: {}", style(ct_type).green());
+            println!("Saving to: {}", style(&self.fname).green());
+            if let Some(val) = headers.get(header::CONTENT_LENGTH) {
+                if let Ok(val) = val.to_str().unwrap_or("").parse::<u64>() {
+                    let length = val + self.bytes_on_disk.unwrap_or(0);
+                    self.create_prog_bar(Some(length));
+                } else {
+                    self.create_prog_bar(None);
+                }
+            } else {
+                println!(
+                    "{}",
+                    style("Got no content-length. Progress bar skipped.").red()
+                );
             }
-        } else {
-            println!(
-                "{}",
-                style("Got no content-length. Progress bar skipped.").red()
-            );
         }
     }
 
+    #[cfg(feature = "enable-ftp")]
     fn on_ftp_content_length(&mut self, ct_len: Option<u64>) {
         if !self.quiet_mode {
             self.create_prog_bar(ct_len);
@@ -270,9 +288,12 @@ impl EventsHandler for DefaultEventsHandler {
         self.server_supports_resume = true;
     }
 
+    #[allow(unused_variables)]
     fn on_content(&mut self, content: &[u8]) -> Result<()> {
         let byte_count = content.len() as u64;
         self.file.write_all(content)?;
+
+        #[cfg(feature = "default")]
         if let Some(ref mut b) = self.prog_bar {
             b.inc(byte_count);
         }
@@ -290,6 +311,8 @@ impl EventsHandler for DefaultEventsHandler {
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(buf)?;
         self.file.flush()?;
+
+        #[cfg(feature = "default")]
         if let Some(ref mut b) = self.prog_bar {
             b.inc(byte_count);
         }
@@ -306,6 +329,8 @@ impl EventsHandler for DefaultEventsHandler {
 
     fn on_finish(&mut self) {
         log::info!("on_finish");
+
+        #[cfg(feature = "default")]
         if let Some(ref mut b) = self.prog_bar {
             b.finish();
         }
@@ -313,6 +338,7 @@ impl EventsHandler for DefaultEventsHandler {
     }
 
     fn on_max_retries(&mut self) {
+        #[cfg(feature = "default")]
         if !self.quiet_mode {
             eprintln!("{}", style("max retries exceeded. Quitting!").red());
         }
@@ -323,10 +349,12 @@ impl EventsHandler for DefaultEventsHandler {
         ::std::process::exit(0);
     }
 
+    #[allow(unused_variables)]
     fn on_failure_status(&self, status: i32) {
         if self.quiet_mode {
             return;
         }
+        #[cfg(feature = "default")]
         if status == 416 {
             println!(
                 "{}",
