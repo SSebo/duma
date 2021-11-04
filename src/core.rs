@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use url::Url;
@@ -17,7 +18,7 @@ pub struct Config {
     pub file: String,
     pub timeout: u64,
     pub concurrent: bool,
-    pub max_retries: i32,
+    pub max_retries: u64,
     pub num_workers: usize,
     pub bytes_on_disk: Option<u64>,
     pub chunk_offsets: Option<Vec<(u64, u64)>>,
@@ -59,7 +60,7 @@ pub struct HttpDownload {
     url: Url,
     hooks: Arc<Mutex<Vec<Box<dyn EventsHandler + Send>>>>,
     conf: Config,
-    retries: Arc<Mutex<i32>>,
+    retries: Arc<Mutex<u64>>,
     client: Client,
 }
 
@@ -170,66 +171,25 @@ impl HttpDownload {
             .clone()
             .unwrap_or_else(|| self.get_chunk_offsets(ct_len, self.conf.chunk_size));
         let sem = Arc::new(Semaphore::new(self.conf.num_workers));
-        let sem_clone = sem.clone();
-        let data_tx_clone = data_tx.clone();
-        let errors_tx_clone = errors_tx.clone();
-        let req_clone = req.try_clone().unwrap();
-
-        tokio::spawn(async move {
-            for offsets in chunk_offsets {
-                let data_tx = data_tx_clone.clone();
-                let errors_tx = errors_tx_clone.clone();
-                let req = req_clone.try_clone().unwrap();
-                let permit = sem_clone.clone().acquire_owned().await;
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    download_chunk(req, offsets, data_tx.clone(), errors_tx).await
-                });
-            }
-        });
+        do_concurrent_download(
+            req.try_clone().unwrap(),
+            chunk_offsets,
+            data_tx.clone(),
+            errors_tx.clone(),
+            sem.clone(),
+        );
 
         let mut count = self.conf.bytes_on_disk.unwrap_or(0);
-        let hooks = self.hooks.clone();
-        let hooks_clone = self.hooks.clone();
-        let retries = self.retries.clone();
-        let max_retries = self.conf.max_retries;
         let bytes_on_disk = count;
-
-        tokio::spawn(async move {
-            match tokio::time::timeout(tokio::time::Duration::from_micros(1), errors_rx.recv())
-                .await
-            {
-                Err(_) => {}
-                Ok(None) => {}
-                Ok(Some(offsets)) => {
-                    let mut retry_guard = retries.lock().await;
-                    log::error!("timeout retry {}", *retry_guard);
-                    if *retry_guard > max_retries {
-                        run_hooks(hooks, Box::new(|hk| hk.on_max_retries())).await;
-                    }
-
-                    *retry_guard += 1;
-                    let data_tx = data_tx.clone();
-                    let errors_tx = errors_tx.clone();
-                    let req = req.try_clone().unwrap();
-                    let permit = sem.clone().acquire_owned().await;
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        download_chunk(req, offsets, data_tx, errors_tx).await
-                    });
-                }
-            }
-        });
 
         loop {
             if count == ct_len + bytes_on_disk {
                 break;
             }
             if let Some((byte_count, offset, buf)) = data_rx.recv().await {
-                log::info!("got chunk {}", byte_count);
                 count += byte_count;
                 if let Err(e) = try_run_hooks(
-                    hooks_clone.clone(),
+                    self.hooks.clone(),
                     Box::new(move |hk| hk.on_concurrent_content((byte_count, offset, &buf))),
                 )
                 .await
@@ -238,8 +198,42 @@ impl HttpDownload {
                     return Err(e);
                 }
             }
+            self.do_retry_download(
+                req.try_clone().unwrap(),
+                data_tx.clone(),
+                &mut errors_rx,
+                errors_tx.clone(),
+                sem.clone(),
+            )
+            .await
         }
         Ok(())
+    }
+
+    async fn do_retry_download(
+        &self,
+        req: Request,
+        data_tx: UnboundedSender<(u64, u64, Vec<u8>)>,
+        errors_rx: &mut UnboundedReceiver<(u64, u64)>,
+        errors_tx: UnboundedSender<(u64, u64)>,
+        sem: Arc<Semaphore>,
+    ) {
+        if let Ok(Some(offsets)) =
+            tokio::time::timeout(tokio::time::Duration::from_micros(1), errors_rx.recv()).await
+        {
+            let mut retry_guard = self.retries.lock().await;
+            if *retry_guard > self.conf.max_retries {
+                run_hooks(self.hooks.clone(), Box::new(|hk| hk.on_max_retries())).await;
+                return;
+            }
+            log::error!("timeout retry {} for offset {:?}", *retry_guard, offsets);
+            *retry_guard += 1;
+            let permit = sem.clone().acquire_owned().await;
+            tokio::spawn(async move {
+                let _permit = permit;
+                download_chunk(req, offsets, data_tx, errors_tx).await
+            });
+        }
     }
 
     fn get_chunk_offsets(&self, ct_len: u64, chunk_size: u64) -> Vec<(u64, u64)> {
@@ -268,6 +262,27 @@ impl HttpDownload {
             .iter_mut()
             .try_for_each(|hk| hk.on_content(contents))
     }
+}
+
+fn do_concurrent_download(
+    req: Request,
+    chunk_offsets: Vec<(u64, u64)>,
+    data_tx: UnboundedSender<(u64, u64, Vec<u8>)>,
+    errors_tx: UnboundedSender<(u64, u64)>,
+    sem: Arc<Semaphore>,
+) {
+    tokio::spawn(async move {
+        for offsets in chunk_offsets {
+            let dtx = data_tx.clone();
+            let etx = errors_tx.clone();
+            let r = req.try_clone().unwrap();
+            let permit = sem.clone().acquire_owned().await;
+            tokio::spawn(async move {
+                let _permit = permit;
+                download_chunk(r, offsets, dtx.clone(), etx).await
+            });
+        }
+    });
 }
 
 async fn download_chunk(
