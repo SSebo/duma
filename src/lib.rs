@@ -7,3 +7,4 @@ pub mod download;
 #[cfg(feature = "ftp")]
 pub mod ftp;
 pub mod utils;
+pub mod progress;
