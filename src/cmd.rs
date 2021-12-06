@@ -1,13 +1,15 @@
 use crate::core::Config;
 #[cfg(feature = "enable-ftp")]
 use crate::download::ftp_download;
+#[cfg(feature = "default")]
 use crate::download::print_headers;
 use crate::download::{
     calc_bytes_on_disk, gen_filename, get_resume_chunk_offsets, http_download, prep_headers,
-    request_headers_from_server,
+    request_headers_from_server, DefaultEventsHandler,
 };
 use crate::utils;
 use anyhow::{format_err, Result};
+#[cfg(any(feature = "test", feature = "default"))]
 use clap::{clap_app, crate_version};
 use std::path::Path;
 
@@ -36,7 +38,9 @@ pub async fn run() -> Result<()> {
         args.value_of("URL")
             .ok_or_else(|| format_err!("missing URL argument"))?,
     )?;
+    #[cfg(feature = "enable-ftp")]
     let quiet_mode = args.is_present("quiet");
+    #[cfg(feature = "enable-ftp")]
     let file_name = args.value_of("FILE");
     let version = crate_version!();
     let resume_download = args.is_present("continue");
@@ -60,6 +64,7 @@ pub async fn run() -> Result<()> {
 
     // early exit if headers flag is present
     if args.is_present("headers") {
+        #[cfg(feature = "default")]
         print_headers(headers);
         return Ok(());
     }
@@ -101,10 +106,31 @@ pub async fn run() -> Result<()> {
         quiet_mode: args.is_present("quiet"),
     };
 
+    #[cfg(not(feature = "default"))]
+    let events_handler = Box::new(
+        DefaultEventsHandler::<crate::progress::ProgressCallback>::new(
+            &conf.file,
+            conf.resume,
+            conf.concurrent,
+            conf.quiet_mode,
+        )
+        .unwrap(),
+    );
+
+    #[cfg(feature = "default")]
+    let events_handler = Box::new(
+        DefaultEventsHandler::<crate::progress::ProgressBar>::new(
+            &conf.file,
+            conf.resume,
+            conf.concurrent,
+            conf.quiet_mode,
+        )
+        .unwrap(),
+    );
     match url.scheme() {
         #[cfg(feature = "enable-ftp")]
         "ftp" => ftp_download(url, quiet_mode, file_name),
-        "http" | "https" => http_download(url, conf).await,
+        "http" | "https" => http_download(url, conf, events_handler).await,
         _ => utils::gen_error(format!("unsupported url scheme '{}'", url.scheme())),
     }
 }

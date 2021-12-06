@@ -1,7 +1,7 @@
 #[cfg(feature = "default")]
 use crate::bar::create_progress_bar;
 #[cfg(feature = "default")]
-use indicatif::ProgressBar;
+pub use indicatif::ProgressBar;
 
 pub trait Progress: Send + Sync {
     fn new(msg: &str, length: Option<u64>) -> Self;
@@ -35,8 +35,12 @@ impl Progress for ProgressCallback {
     }
 
     #[allow(unused_variables)]
-    fn inc(&self, delta: u64) {}
+    fn inc(&self, delta: u64) {
+        println!("inc {}", delta);
+    }
 
     #[allow(unused_variables)]
-    fn finish(&self, status: u8, path: Option<String>) {}
+    fn finish(&self, status: u8, path: Option<String>) {
+        println!("finish {} {:?}", status, path)
+    }
 }

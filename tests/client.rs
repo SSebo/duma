@@ -30,6 +30,7 @@ fn test_request_timeout() {
 
 #[test]
 #[cfg(all(unix))]
+#[cfg(feature = "default")]
 fn test_headers() {
     setup();
     let mut cmd = Command::cargo_bin(env!("CARGO_PKG_NAME")).unwrap();

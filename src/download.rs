@@ -174,24 +174,13 @@ pub fn ftp_download(url: Url, quiet_mode: bool, filename: Option<&str>) -> Resul
     Ok(())
 }
 
-pub async fn http_download(url: Url, conf: Config) -> Result<()> {
+pub async fn http_download(
+    url: Url,
+    conf: Config,
+    events_handler: Box<impl EventsHandler + Send + 'static>,
+) -> Result<()> {
     let mut client = HttpDownload::new(url, conf.clone());
-
-    #[cfg(feature = "default")]
-    let events_handler = DefaultEventsHandler::<ProgressBar>::new(
-        &conf.file,
-        conf.resume,
-        conf.concurrent,
-        conf.quiet_mode,
-    )?;
-    #[cfg(not(feature = "default"))]
-    let events_handler = DefaultEventsHandler::<crate::progress::ProgressCallback>::new(
-        &conf.file,
-        conf.resume,
-        conf.concurrent,
-        conf.quiet_mode,
-    )?;
-    client.events_hook(events_handler).await.download().await?;
+    client.events_hook(*events_handler).await.download().await?;
     Ok(())
 }
 
@@ -327,7 +316,6 @@ impl<P: Progress> EventsHandler for DefaultEventsHandler<P> {
         self.file.write_all(buf)?;
         self.file.flush()?;
 
-        #[cfg(feature = "default")]
         if let Some(ref mut b) = self.progress {
             b.inc(byte_count);
         }
@@ -345,7 +333,6 @@ impl<P: Progress> EventsHandler for DefaultEventsHandler<P> {
     fn on_finish(&mut self) {
         log::info!("on_finish");
 
-        #[cfg(feature = "default")]
         if let Some(ref mut b) = self.progress {
             b.finish(0, Some(self.fname.clone()));
         }

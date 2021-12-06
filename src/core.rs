@@ -198,14 +198,18 @@ impl HttpDownload {
                     return Err(e);
                 }
             }
-            self.do_retry_download(
-                req.try_clone().unwrap(),
-                data_tx.clone(),
-                &mut errors_rx,
-                errors_tx.clone(),
-                sem.clone(),
-            )
-            .await
+            let max_retry = self
+                .do_retry_download(
+                    req.try_clone().unwrap(),
+                    data_tx.clone(),
+                    &mut errors_rx,
+                    errors_tx.clone(),
+                    sem.clone(),
+                )
+                .await;
+            if max_retry {
+                break;
+            }
         }
         Ok(())
     }
@@ -217,14 +221,14 @@ impl HttpDownload {
         errors_rx: &mut UnboundedReceiver<(u64, u64)>,
         errors_tx: UnboundedSender<(u64, u64)>,
         sem: Arc<Semaphore>,
-    ) {
+    ) -> bool {
         if let Ok(Some(offsets)) =
             tokio::time::timeout(tokio::time::Duration::from_micros(1), errors_rx.recv()).await
         {
             let mut retry_guard = self.retries.lock().await;
             if *retry_guard > self.conf.max_retries {
                 run_hooks(self.hooks.clone(), Box::new(|hk| hk.on_max_retries())).await;
-                return;
+                return true;
             }
             log::error!("timeout retry {} for offset {:?}", *retry_guard, offsets);
             *retry_guard += 1;
@@ -234,6 +238,7 @@ impl HttpDownload {
                 download_chunk(req, offsets, data_tx, errors_tx).await
             });
         }
+        return false;
     }
 
     fn get_chunk_offsets(&self, ct_len: u64, chunk_size: u64) -> Vec<(u64, u64)> {
