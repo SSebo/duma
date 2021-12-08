@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -62,6 +62,7 @@ pub struct HttpDownload {
     conf: Config,
     retries: Arc<Mutex<u64>>,
     client: Client,
+    is_cancel: Arc<RwLock<bool>>,
 }
 
 impl fmt::Debug for HttpDownload {
@@ -78,7 +79,13 @@ impl HttpDownload {
             conf,
             retries: Arc::new(Mutex::new(0)),
             client: Client::new(),
+            is_cancel: Arc::new(RwLock::new(false)),
         }
+    }
+
+    pub async fn cancel(&mut self) {
+        let mut guard = self.is_cancel.write().await;
+        *guard = true;
     }
 
     pub async fn download(&mut self) -> Result<()> {
@@ -155,6 +162,9 @@ impl HttpDownload {
     async fn singlethread_download(&mut self, req: Request) -> Result<()> {
         let mut resp = self.client.execute(req).await?;
         while let Some(bytes) = resp.chunk().await? {
+            if *(self.is_cancel.read().await) {
+                break;
+            }
             log::info!("single thread got chunk");
             self.send_content(&bytes.to_vec()).await?;
         }
@@ -171,18 +181,23 @@ impl HttpDownload {
             .clone()
             .unwrap_or_else(|| self.get_chunk_offsets(ct_len, self.conf.chunk_size));
         let sem = Arc::new(Semaphore::new(self.conf.num_workers));
+        let is_cancel = self.is_cancel.clone();
         do_concurrent_download(
             req.try_clone().unwrap(),
             chunk_offsets,
             data_tx.clone(),
             errors_tx.clone(),
             sem.clone(),
+            is_cancel,
         );
 
         let mut count = self.conf.bytes_on_disk.unwrap_or(0);
         let bytes_on_disk = count;
 
         loop {
+            if *(self.is_cancel.read().await) {
+                break;
+            }
             if count == ct_len + bytes_on_disk {
                 break;
             }
@@ -275,12 +290,17 @@ fn do_concurrent_download(
     data_tx: UnboundedSender<(u64, u64, Vec<u8>)>,
     errors_tx: UnboundedSender<(u64, u64)>,
     sem: Arc<Semaphore>,
+    is_cancel: Arc<RwLock<bool>>,
 ) {
     tokio::spawn(async move {
         for offsets in chunk_offsets {
             let dtx = data_tx.clone();
             let etx = errors_tx.clone();
             let r = req.try_clone().unwrap();
+            let is_cancel = is_cancel.read().await;
+            if *is_cancel {
+                break;
+            }
             let permit = sem.clone().acquire_owned().await;
             tokio::spawn(async move {
                 let _permit = permit;
