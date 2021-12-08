@@ -15,7 +15,6 @@ pub struct Config {
     pub user_agent: String,
     pub resume: bool,
     pub headers: HeaderMap,
-    pub file: String,
     pub timeout: u64,
     pub concurrent: bool,
     pub max_retries: u64,

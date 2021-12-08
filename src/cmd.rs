@@ -95,7 +95,6 @@ pub async fn run() -> Result<()> {
         user_agent,
         resume: resume_download,
         headers,
-        file: fname.clone(),
         timeout,
         concurrent: concurrent_download,
         max_retries: 100,
@@ -109,7 +108,7 @@ pub async fn run() -> Result<()> {
     #[cfg(not(feature = "default"))]
     let events_handler = Box::new(
         DefaultEventsHandler::<crate::progress::ProgressCallback>::new(
-            &conf.file,
+            &fname,
             conf.resume,
             conf.concurrent,
             conf.quiet_mode,
@@ -120,7 +119,7 @@ pub async fn run() -> Result<()> {
     #[cfg(feature = "default")]
     let events_handler = Box::new(
         DefaultEventsHandler::<crate::progress::ProgressBar>::new(
-            &conf.file,
+            &fname,
             conf.resume,
             conf.concurrent,
             conf.quiet_mode,
