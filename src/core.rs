@@ -82,7 +82,7 @@ impl HttpDownload {
         }
     }
 
-    pub async fn cancel(&mut self) {
+    pub async fn cancel(&self) {
         let mut guard = self.is_cancel.write().await;
         *guard = true;
     }
